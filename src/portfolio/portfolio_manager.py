@@ -1,0 +1,325 @@
+"""
+Portfolio Manager - Manages portfolio, tracks P&L, and monitors risk
+
+Handles:
+- Position management
+- Cash management
+- Realized and unrealized P&L tracking
+- Portfolio exposure monitoring
+"""
+
+from typing import Dict, Optional, List
+from datetime import datetime
+from tabulate import tabulate
+
+from .position import Position
+
+
+class PortfolioManager:
+    """
+    Manages the trading portfolio.
+    
+    Tracks positions, cash, and calculates P&L and exposure metrics.
+    """
+    
+    def __init__(self, initial_capital: float = 100000.0):
+        """
+        Initialize portfolio manager.
+        
+        Args:
+            initial_capital: Starting capital
+        """
+        self.initial_capital = initial_capital
+        self.cash = initial_capital
+        self.positions: Dict[str, Position] = {}
+        
+        # P&L tracking
+        self.realized_pnl = 0.0
+        self.total_commission = 0.0
+        
+        # Trade history
+        self.trade_history: List[Dict] = []
+    
+    def buy(
+        self,
+        symbol: str,
+        quantity: int,
+        price: float,
+        commission: float = 0.0
+    ):
+        """
+        Buy an asset.
+        
+        Args:
+            symbol: Asset symbol
+            quantity: Quantity to buy
+            price: Purchase price
+            commission: Transaction commission
+        """
+        cost = quantity * price + commission
+        
+        # Check if we have enough cash
+        if cost > self.cash:
+            raise ValueError(f"Insufficient cash: need ${cost:.2f}, have ${self.cash:.2f}")
+        
+        # Deduct cash
+        self.cash -= cost
+        self.total_commission += commission
+        
+        # Update or create position
+        if symbol in self.positions:
+            self.positions[symbol].add_quantity(quantity, price)
+        else:
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                quantity=quantity,
+                avg_entry_price=price,
+                current_price=price
+            )
+        
+        # Record trade
+        self.trade_history.append({
+            'timestamp': datetime.now(),
+            'symbol': symbol,
+            'action': 'BUY',
+            'quantity': quantity,
+            'price': price,
+            'commission': commission,
+            'cash_after': self.cash
+        })
+    
+    def sell(
+        self,
+        symbol: str,
+        quantity: int,
+        price: float,
+        commission: float = 0.0
+    ):
+        """
+        Sell an asset.
+        
+        Args:
+            symbol: Asset symbol
+            quantity: Quantity to sell
+            price: Sale price
+            commission: Transaction commission
+        """
+        # Check if we have the position
+        if symbol not in self.positions:
+            raise ValueError(f"No position in {symbol}")
+        
+        position = self.positions[symbol]
+        
+        # Check if we have enough quantity
+        if quantity > position.quantity:
+            raise ValueError(
+                f"Insufficient quantity: trying to sell {quantity}, "
+                f"have {position.quantity}"
+            )
+        
+        # Update current price before calculating P&L
+        position.update_price(price)
+        
+        # Calculate realized P&L
+        realized_pnl = position.reduce_quantity(quantity)
+        self.realized_pnl += realized_pnl
+        
+        # Add cash from sale
+        proceeds = quantity * price - commission
+        self.cash += proceeds
+        self.total_commission += commission
+        
+        # Remove position if fully closed
+        if position.quantity == 0:
+            del self.positions[symbol]
+        
+        # Record trade
+        self.trade_history.append({
+            'timestamp': datetime.now(),
+            'symbol': symbol,
+            'action': 'SELL',
+            'quantity': quantity,
+            'price': price,
+            'commission': commission,
+            'realized_pnl': realized_pnl,
+            'cash_after': self.cash
+        })
+    
+    def update_prices(self, prices: Dict[str, float]):
+        """
+        Update current market prices for all positions.
+        
+        Args:
+            prices: Dictionary of symbol -> current_price
+        """
+        for symbol, position in self.positions.items():
+            if symbol in prices:
+                position.update_price(prices[symbol])
+    
+    def get_position(self, symbol: str) -> Optional[Position]:
+        """
+        Get position for a symbol.
+        
+        Args:
+            symbol: Asset symbol
+            
+        Returns:
+            Position object or None
+        """
+        return self.positions.get(symbol)
+    
+    def get_unrealized_pnl(self) -> float:
+        """
+        Get total unrealized P&L across all positions.
+        
+        Returns:
+            Total unrealized P&L
+        """
+        return sum(pos.get_unrealized_pnl() for pos in self.positions.values())
+    
+    def get_total_pnl(self) -> float:
+        """
+        Get total P&L (realized + unrealized).
+        
+        Returns:
+            Total P&L
+        """
+        return self.realized_pnl + self.get_unrealized_pnl()
+    
+    def get_portfolio_value(self) -> float:
+        """
+        Get total value of positions (excluding cash).
+        
+        Returns:
+            Total market value of all positions
+        """
+        return sum(pos.get_market_value() for pos in self.positions.values())
+    
+    def get_total_value(self) -> float:
+        """
+        Get total portfolio value (positions + cash).
+        
+        Returns:
+            Total portfolio value
+        """
+        return self.cash + self.get_portfolio_value()
+    
+    def get_exposure(self) -> Dict[str, float]:
+        """
+        Get exposure per asset as percentage of portfolio.
+        
+        Returns:
+            Dictionary of symbol -> exposure_percentage
+        """
+        total_value = self.get_total_value()
+        
+        if total_value == 0:
+            return {}
+        
+        exposure = {}
+        for symbol, position in self.positions.items():
+            market_value = position.get_market_value()
+            exposure[symbol] = (market_value / total_value) * 100
+        
+        return exposure
+    
+    def get_total_exposure(self) -> float:
+        """
+        Get total portfolio exposure (% of capital invested).
+        
+        Returns:
+            Total exposure percentage
+        """
+        total_value = self.get_total_value()
+        
+        if total_value == 0:
+            return 0.0
+        
+        portfolio_value = self.get_portfolio_value()
+        return (portfolio_value / total_value) * 100
+    
+    def print_summary(self):
+        """Print detailed portfolio summary."""
+        print(f"\n{'='*80}")
+        print(f"PORTFOLIO SUMMARY")
+        print(f"{'='*80}\n")
+        
+        # Account summary
+        print(f"Initial Capital:        ${self.initial_capital:>15,.2f}")
+        print(f"Current Cash:           ${self.cash:>15,.2f}")
+        print(f"Portfolio Value:        ${self.get_portfolio_value():>15,.2f}")
+        print(f"Total Value:            ${self.get_total_value():>15,.2f}")
+        print(f"-" * 80)
+        
+        # P&L summary
+        total_pnl = self.get_total_pnl()
+        pnl_pct = (total_pnl / self.initial_capital) * 100
+        
+        print(f"Realized P&L:           ${self.realized_pnl:>15,.2f}")
+        print(f"Unrealized P&L:         ${self.get_unrealized_pnl():>15,.2f}")
+        print(f"Total P&L:              ${total_pnl:>15,.2f} ({pnl_pct:>6.2f}%)")
+        print(f"Total Commissions:      ${self.total_commission:>15,.2f}")
+        print(f"-" * 80)
+        
+        # Exposure
+        print(f"Portfolio Exposure:     {self.get_total_exposure():>15.2f}%")
+        print(f"-" * 80)
+        
+        # Positions
+        if self.positions:
+            print(f"\nOPEN POSITIONS:")
+            print(f"-" * 80)
+            
+            position_data = []
+            for symbol, pos in self.positions.items():
+                position_data.append([
+                    symbol,
+                    pos.quantity,
+                    f"${pos.avg_entry_price:.2f}",
+                    f"${pos.current_price:.2f}",
+                    f"${pos.get_market_value():.2f}",
+                    f"${pos.get_unrealized_pnl():.2f}",
+                    f"{pos.get_unrealized_pnl_percent():.2f}%"
+                ])
+            
+            headers = ['Symbol', 'Qty', 'Avg Entry', 'Current', 'Value', 'Unrealized P&L', 'Return %']
+            print(tabulate(position_data, headers=headers, tablefmt='grid'))
+        else:
+            print(f"\nNo open positions")
+        
+        # Exposure by asset
+        if self.positions:
+            print(f"\nEXPOSURE BY ASSET:")
+            print(f"-" * 80)
+            
+            exposure = self.get_exposure()
+            exposure_data = [[symbol, f"{exp:.2f}%"] for symbol, exp in exposure.items()]
+            
+            print(tabulate(exposure_data, headers=['Symbol', 'Exposure'], tablefmt='grid'))
+        
+        print(f"\n{'='*80}\n")
+    
+    def get_statistics(self) -> Dict:
+        """
+        Get portfolio statistics.
+        
+        Returns:
+            Dictionary of statistics
+        """
+        total_value = self.get_total_value()
+        total_return = (total_value - self.initial_capital) / self.initial_capital
+        
+        return {
+            'initial_capital': self.initial_capital,
+            'current_cash': self.cash,
+            'portfolio_value': self.get_portfolio_value(),
+            'total_value': total_value,
+            'realized_pnl': self.realized_pnl,
+            'unrealized_pnl': self.get_unrealized_pnl(),
+            'total_pnl': self.get_total_pnl(),
+            'total_return': total_return,
+            'total_commission': self.total_commission,
+            'num_positions': len(self.positions),
+            'total_exposure': self.get_total_exposure(),
+            'num_trades': len(self.trade_history)
+        }
