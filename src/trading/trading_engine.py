@@ -212,9 +212,22 @@ class TradingEngine:
             simulator.step()
             step_count += 1
             
-            # Print progress
+            # Print progress with P&L and exposure snapshots
             if verbose and step_count % 50 == 0:
-                print(f"Step {step_count}: Portfolio Value = ${self.portfolio.get_total_value():,.2f}")
+                total_value = self.portfolio.get_total_value()
+                realized_pnl = self.portfolio.realized_pnl
+                unrealized_pnl = self.portfolio.get_unrealized_pnl()
+                exposure = self.portfolio.get_total_exposure()
+                print(
+                    "Step {:<5d}: Value=${:>12,.2f} | Realized=${:>10,.2f} | "
+                    "Unrealized=${:>10,.2f} | Exposure={:>6.2f}%".format(
+                        step_count,
+                        total_value,
+                        realized_pnl,
+                        unrealized_pnl,
+                        exposure
+                    )
+                )
         
         # Calculate performance metrics
         metrics = self._calculate_metrics(equity_curve)
@@ -260,20 +273,32 @@ class TradingEngine:
         df['cummax'] = df['equity'].cummax()
         df['drawdown'] = (df['equity'] - df['cummax']) / df['cummax']
         max_drawdown = df['drawdown'].min()
-        
+
         # Trade statistics
         num_trades = len(self.trade_log)
-        
-        # Win rate (simplified)
-        wins = sum(1 for trade in self.trade_log if trade['side'] == 'SELL')
-        win_rate = wins / num_trades if num_trades > 0 else 0
-        
+
+        # Win rate and profit factor based on realized P&L from portfolio history
+        pnl_trades = [
+            t['realized_pnl']
+            for t in self.portfolio.trade_history
+            if 'realized_pnl' in t
+        ]
+        num_closed = len(pnl_trades)
+        wins = sum(1 for pnl in pnl_trades if pnl > 0)
+        losses = sum(1 for pnl in pnl_trades if pnl < 0)
+        total_wins = sum(pnl for pnl in pnl_trades if pnl > 0)
+        total_losses = abs(sum(pnl for pnl in pnl_trades if pnl < 0))
+
+        win_rate = wins / num_closed if num_closed > 0 else 0
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+
         return {
             'total_return': total_return,
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
             'num_trades': num_trades,
             'win_rate': win_rate,
+            'profit_factor': profit_factor,
             'final_value': final_value,
             'initial_value': initial_value
         }
@@ -291,6 +316,7 @@ class TradingEngine:
         print(f"Max Drawdown:     {metrics['max_drawdown']*100:>10.2f}%")
         print(f"Number of Trades: {metrics['num_trades']:>10}")
         print(f"Win Rate:         {metrics['win_rate']*100:>10.2f}%")
+        print(f"Profit Factor:    {metrics['profit_factor']:>10.2f}")
         print(f"{'='*60}\n")
     
     def get_trade_history(self) -> pd.DataFrame:
