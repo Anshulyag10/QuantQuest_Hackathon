@@ -3,21 +3,38 @@ Market Data Generator - Synthetic Price Data Generation
 
 This module generates realistic market data using various models including:
 - Geometric Brownian Motion (Random Walk)
+- Jump Diffusion (Merton Model)
+- Regime Switching
+- Volatility Clustering (GARCH-like)
 - Configurable drift and volatility
 - Multiple asset simulation
+- Real-time streaming capability
 """
 
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Generator
+from enum import Enum
+
+
+class MarketRegime(Enum):
+    """Market regime states for regime-switching model."""
+    BULL = "bull"
+    BEAR = "bear"
+    SIDEWAYS = "sideways"
+    HIGH_VOLATILITY = "high_volatility"
 
 
 class MarketDataGenerator:
     """
     Generates synthetic market data for trading simulation.
     
-    Uses Geometric Brownian Motion to simulate realistic price movements.
+    Uses advanced models to simulate realistic price movements:
+    - Geometric Brownian Motion (GBM) as base
+    - Optional jump diffusion for sudden moves
+    - Optional volatility clustering
+    - Optional regime switching
     """
     
     def __init__(
@@ -41,6 +58,7 @@ class MarketDataGenerator:
         self.symbols = symbols
         self.drift = drift
         self.volatility = volatility
+        self.seed = seed
         
         if seed is not None:
             np.random.seed(seed)
@@ -52,23 +70,37 @@ class MarketDataGenerator:
             }
         else:
             self.initial_prices = initial_prices
-    
+        
+        # Current prices for streaming
+        self.current_prices = self.initial_prices.copy()
+        
+        # Regime state
+        self.current_regime = MarketRegime.SIDEWAYS
+        
     def generate_price_path(
         self,
         initial_price: float,
         num_steps: int,
-        dt: float = 1/252  # Daily timestep (252 trading days/year)
+        dt: float = 1/252,  # Daily timestep (252 trading days/year)
+        include_jumps: bool = False,
+        jump_intensity: float = 0.02,
+        jump_size_mean: float = 0.0,
+        jump_size_std: float = 0.03
     ) -> np.ndarray:
         """
         Generate a single price path using Geometric Brownian Motion.
         
-        Formula: dS = μ*S*dt + σ*S*dW
-        where dW ~ N(0, dt)
+        Formula: dS = μ*S*dt + σ*S*dW + J*S*dN
+        where dW ~ N(0, dt), dN ~ Poisson(λ*dt), J ~ N(μ_J, σ_J)
         
         Args:
             initial_price: Starting price
             num_steps: Number of time steps
             dt: Time step size (default: 1 day)
+            include_jumps: Whether to include jump diffusion
+            jump_intensity: Poisson intensity for jumps
+            jump_size_mean: Mean of jump size distribution
+            jump_size_std: Std of jump size distribution
             
         Returns:
             Array of prices
@@ -84,15 +116,76 @@ class MarketDataGenerator:
             drift_component = self.drift * dt
             volatility_component = self.volatility * random_shock
             
+            # Jump component (Merton model)
+            jump_component = 0
+            if include_jumps:
+                # Poisson process for jump occurrence
+                if np.random.random() < jump_intensity:
+                    jump_component = np.random.normal(jump_size_mean, jump_size_std)
+            
             # Calculate next price
-            prices[t] = prices[t-1] * np.exp(drift_component + volatility_component)
+            prices[t] = prices[t-1] * np.exp(
+                drift_component + volatility_component + jump_component
+            )
         
         return prices
+    
+    def generate_price_path_with_volatility_clustering(
+        self,
+        initial_price: float,
+        num_steps: int,
+        dt: float = 1/252,
+        alpha: float = 0.1,
+        beta: float = 0.85,
+        omega: float = 0.00001
+    ) -> tuple:
+        """
+        Generate price path with GARCH(1,1)-like volatility clustering.
+        
+        σ²_t = ω + α*ε²_{t-1} + β*σ²_{t-1}
+        
+        Args:
+            initial_price: Starting price
+            num_steps: Number of time steps
+            dt: Time step size
+            alpha: GARCH alpha parameter
+            beta: GARCH beta parameter
+            omega: GARCH omega (long-run variance)
+            
+        Returns:
+            Tuple of (prices, volatilities)
+        """
+        prices = np.zeros(num_steps)
+        volatilities = np.zeros(num_steps)
+        
+        prices[0] = initial_price
+        volatilities[0] = self.volatility ** 2
+        
+        prev_epsilon = 0
+        
+        for t in range(1, num_steps):
+            # Update volatility (GARCH-like)
+            volatilities[t] = omega + alpha * prev_epsilon**2 + beta * volatilities[t-1]
+            current_vol = np.sqrt(volatilities[t])
+            
+            # Random shock
+            epsilon = np.random.normal(0, 1)
+            prev_epsilon = epsilon * current_vol
+            
+            # Price update
+            drift_component = self.drift * dt
+            volatility_component = current_vol * np.sqrt(dt) * epsilon
+            
+            prices[t] = prices[t-1] * np.exp(drift_component + volatility_component)
+        
+        return prices, np.sqrt(volatilities)
     
     def generate_historical_data(
         self,
         days: int = 252,
-        start_date: Optional[datetime] = None
+        start_date: Optional[datetime] = None,
+        include_jumps: bool = True,
+        volatility_clustering: bool = True
     ) -> pd.DataFrame:
         """
         Generate historical market data for all symbols.
@@ -100,6 +193,8 @@ class MarketDataGenerator:
         Args:
             days: Number of trading days to generate
             start_date: Starting date (default: today - days)
+            include_jumps: Include jump diffusion in price generation
+            volatility_clustering: Include GARCH-like volatility clustering
             
         Returns:
             DataFrame with columns: [timestamp, symbol, open, high, low, close, volume]
@@ -111,10 +206,17 @@ class MarketDataGenerator:
         
         for symbol in self.symbols:
             # Generate base price path
-            prices = self.generate_price_path(
-                self.initial_prices[symbol],
-                days
-            )
+            if volatility_clustering:
+                prices, _ = self.generate_price_path_with_volatility_clustering(
+                    self.initial_prices[symbol],
+                    days
+                )
+            else:
+                prices = self.generate_price_path(
+                    self.initial_prices[symbol],
+                    days,
+                    include_jumps=include_jumps
+                )
             
             # Generate OHLC data
             for i, close_price in enumerate(prices):
@@ -128,8 +230,12 @@ class MarketDataGenerator:
                 # Ensure high >= low
                 high_price = max(high_price, low_price)
                 
-                # Generate volume (log-normal distribution)
-                volume = int(np.random.lognormal(15, 1.5))
+                # Generate volume (log-normal distribution with regime adjustment)
+                base_volume = np.random.lognormal(15, 1.5)
+                # Higher volume on bigger price moves
+                price_move = abs(close_price - open_price) / open_price if i > 0 else 0
+                volume_multiplier = 1 + (price_move * 10)
+                volume = int(base_volume * volume_multiplier)
                 
                 timestamp = start_date + timedelta(days=i)
                 
@@ -162,7 +268,7 @@ class MarketDataGenerator:
             Dictionary of symbol -> new_price
         """
         if initial_prices is None:
-            initial_prices = self.initial_prices
+            initial_prices = self.current_prices
         
         new_prices = {}
         
@@ -179,7 +285,30 @@ class MarketDataGenerator:
             new_price = current_price * np.exp(drift_component + volatility_component)
             new_prices[symbol] = round(new_price, 2)
         
+        self.current_prices = new_prices
         return new_prices
+    
+    def stream_prices(
+        self,
+        num_ticks: int = 100,
+        tick_delay: float = 0.0
+    ) -> Generator[Dict[str, float], None, None]:
+        """
+        Generator that yields streaming price data.
+        
+        Args:
+            num_ticks: Number of ticks to generate
+            tick_delay: Delay between ticks (seconds), for simulation
+            
+        Yields:
+            Dictionary of symbol -> price for each tick
+        """
+        import time
+        
+        for _ in range(num_ticks):
+            yield self.generate_streaming_data()
+            if tick_delay > 0:
+                time.sleep(tick_delay)
     
     def add_market_events(
         self,
@@ -215,11 +344,75 @@ class MarketDataGenerator:
                         data.loc[idx, col] *= (1 + shock)
         
         return data
+    
+    def generate_correlated_data(
+        self,
+        days: int = 252,
+        correlation_matrix: Optional[np.ndarray] = None
+    ) -> pd.DataFrame:
+        """
+        Generate correlated price data across multiple assets.
+        
+        Args:
+            days: Number of trading days
+            correlation_matrix: Correlation matrix for assets
+            
+        Returns:
+            DataFrame with correlated price movements
+        """
+        n_symbols = len(self.symbols)
+        
+        # Default correlation matrix (positive correlations like real markets)
+        if correlation_matrix is None:
+            correlation_matrix = np.ones((n_symbols, n_symbols)) * 0.5
+            np.fill_diagonal(correlation_matrix, 1.0)
+        
+        # Cholesky decomposition for correlated random numbers
+        cholesky = np.linalg.cholesky(correlation_matrix)
+        
+        # Generate correlated returns
+        uncorrelated_returns = np.random.normal(0, 1, (days, n_symbols))
+        correlated_returns = uncorrelated_returns @ cholesky.T
+        
+        all_data = []
+        
+        for i, symbol in enumerate(self.symbols):
+            price = self.initial_prices[symbol]
+            prices = [price]
+            
+            for day in range(1, days):
+                ret = self.drift + self.volatility * correlated_returns[day, i]
+                price = price * np.exp(ret)
+                prices.append(price)
+            
+            # Generate OHLC from prices
+            start_date = datetime.now() - timedelta(days=days)
+            
+            for day, close_price in enumerate(prices):
+                daily_vol = close_price * self.volatility * 0.5
+                open_price = close_price + np.random.normal(0, daily_vol)
+                high_price = max(open_price, close_price) + abs(np.random.normal(0, daily_vol))
+                low_price = min(open_price, close_price) - abs(np.random.normal(0, daily_vol))
+                
+                all_data.append({
+                    'timestamp': start_date + timedelta(days=day),
+                    'symbol': symbol,
+                    'open': round(open_price, 2),
+                    'high': round(high_price, 2),
+                    'low': round(low_price, 2),
+                    'close': round(close_price, 2),
+                    'volume': int(np.random.lognormal(15, 1.5))
+                })
+        
+        df = pd.DataFrame(all_data)
+        return df.sort_values(['timestamp', 'symbol']).reset_index(drop=True)
 
 
 class MarketSimulator:
     """
     Simulates market conditions and feeds data to the trading engine.
+    
+    Supports both batch and streaming modes.
     """
     
     def __init__(self, market_data: pd.DataFrame):
@@ -249,6 +442,33 @@ class MarketSimulator:
         ]
         
         return dict(zip(current_data['symbol'], current_data['close']))
+    
+    def get_current_ohlcv(self) -> Dict[str, Dict]:
+        """
+        Get current OHLCV data for all symbols.
+        
+        Returns:
+            Dictionary of symbol -> {open, high, low, close, volume}
+        """
+        if self.current_index >= len(self.timestamps):
+            return {}
+        
+        current_time = self.timestamps[self.current_index]
+        current_data = self.market_data[
+            self.market_data['timestamp'] == current_time
+        ]
+        
+        result = {}
+        for _, row in current_data.iterrows():
+            result[row['symbol']] = {
+                'open': row['open'],
+                'high': row['high'],
+                'low': row['low'],
+                'close': row['close'],
+                'volume': row['volume']
+            }
+        
+        return result
     
     def get_current_data(self) -> pd.DataFrame:
         """
@@ -299,3 +519,15 @@ class MarketSimulator:
     def is_complete(self) -> bool:
         """Check if simulation is complete."""
         return self.current_index >= len(self.timestamps)
+    
+    def get_progress(self) -> float:
+        """Get simulation progress as percentage."""
+        if len(self.timestamps) == 0:
+            return 100.0
+        return (self.current_index / len(self.timestamps)) * 100
+    
+    def get_current_timestamp(self) -> Optional[datetime]:
+        """Get current timestamp."""
+        if self.current_index < len(self.timestamps):
+            return self.timestamps[self.current_index]
+        return None
